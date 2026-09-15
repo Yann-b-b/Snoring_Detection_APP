@@ -35,6 +35,9 @@ android {
         compose = true
         mlModelBinding = true
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
