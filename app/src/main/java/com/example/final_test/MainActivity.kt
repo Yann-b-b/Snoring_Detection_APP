@@ -37,6 +37,8 @@ class MainActivity : ComponentActivity() {
         const val HOP_MS = 100
         const val HOP_SAMPLES = SAMPLE_RATE * HOP_MS / 1000
         const val FEATURE_SIZE = 1960                     // 49 frames x 40 channels
+        const val SNORE_PROB_WINDOW = 5                   // decisions smoothed over last N probs
+        const val SNORE_THRESHOLD = 0.6f
     }
 
     private val requestMic =
@@ -110,6 +112,10 @@ class MainActivity : ComponentActivity() {
             val hopPcm = ShortArray(HOP_SAMPLES)
             val window = FloatArray(WINDOW_SAMPLES)
             val input = TensorBuffer.createFixedSize(intArrayOf(1, FEATURE_SIZE), DataType.FLOAT32)
+            val probHistory = FloatArray(SNORE_PROB_WINDOW)
+            val sortedProbs = FloatArray(SNORE_PROB_WINDOW)
+            var probIndex = 0
+            var probCount = 0
 
             while (isActive) {
                 var read = 0
@@ -136,12 +142,18 @@ class MainActivity : ComponentActivity() {
                 input.loadArray(features)
                 val out = m.process(input).outputFeature0AsTensorBuffer.floatArray
 
-                // Labels: 0=snoring, 1=no_snoring, 2=_silence_, 3=_unknown_
-                var maxIdx = 0
-                var maxVal = out[0]
-                for (i in 1 until out.size) if (out[i] > maxVal) { maxVal = out[i]; maxIdx = i }
+                val snoreProb = out[0]
+                probHistory[probIndex] = snoreProb
+                probIndex = (probIndex + 1) % SNORE_PROB_WINDOW
+                if (probCount < SNORE_PROB_WINDOW) probCount++
 
-                val snore = (maxIdx == 0)
+                // Median of the last SNORE_PROB_WINDOW probabilities (fewer while
+                // the history warms up) smooths out single-window flickers.
+                System.arraycopy(probHistory, 0, sortedProbs, 0, probCount)
+                java.util.Arrays.sort(sortedProbs, 0, probCount)
+                val medianProb = sortedProbs[probCount / 2]
+
+                val snore = medianProb > SNORE_THRESHOLD
                 BgBus.post(if (snore) Color.Red else Color.Green)
             }
         }
