@@ -142,6 +142,7 @@ class MainActivity : ComponentActivity() {
                 input.loadArray(features)
                 val out = m.process(input).outputFeature0AsTensorBuffer.floatArray
 
+                // Model output is [1,2] softmax: out[0]=snoring, out[1]=not_snoring.
                 val snoreProb = out[0]
                 probHistory[probIndex] = snoreProb
                 probIndex = (probIndex + 1) % SNORE_PROB_WINDOW
