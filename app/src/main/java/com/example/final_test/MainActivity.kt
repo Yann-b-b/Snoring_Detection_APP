@@ -31,6 +31,14 @@ import kotlin.math.*
 
 class MainActivity : ComponentActivity() {
 
+    private companion object {
+        const val SAMPLE_RATE = 16_000
+        const val WINDOW_SAMPLES = SAMPLE_RATE            // 1 s analysis window
+        const val HOP_MS = 100
+        const val HOP_SAMPLES = SAMPLE_RATE * HOP_MS / 1000
+        const val FEATURE_SIZE = 1960                     // 49 frames x 40 channels
+    }
+
     private val requestMic =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) startListening()
@@ -85,39 +93,45 @@ class MainActivity : ComponentActivity() {
 
     private fun startListening() {
         stopListening()
-        val sr = 16_000
-        val oneSec = sr
 
         val minBuf = AudioRecord.getMinBufferSize(
-            sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC, sr,
+            MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(minBuf, oneSec * 2)
+            maxOf(minBuf, WINDOW_SAMPLES * 2)
         ).apply { startRecording() }
 
         val rec = audioRecord!!
         val m = model ?: return
 
         listenJob = CoroutineScope(Dispatchers.Default).launch {
-            val pcm = ShortArray(oneSec)
-            val floatWave = FloatArray(oneSec)
-            val input = TensorBuffer.createFixedSize(intArrayOf(1, 1960), DataType.FLOAT32)
+            val hopPcm = ShortArray(HOP_SAMPLES)
+            val window = FloatArray(WINDOW_SAMPLES)
+            val input = TensorBuffer.createFixedSize(intArrayOf(1, FEATURE_SIZE), DataType.FLOAT32)
 
             while (isActive) {
                 var read = 0
-                while (read < oneSec) {
-                    val n = rec.read(pcm, read, oneSec - read)
+                while (read < HOP_SAMPLES) {
+                    val n = rec.read(hopPcm, read, HOP_SAMPLES - read)
                     if (n <= 0) break
                     read += n
                 }
-                // PCM 16-bit -> float [-1,1], pad if short
-                for (i in 0 until read) floatWave[i] = pcm[i] / 32768f
-                if (read < oneSec) for (i in read until oneSec) floatWave[i] = 0f
+
+                // Slide the 1 s window left by one hop, append the new 100 ms
+                // (PCM 16-bit -> float [-1,1], zero-pad if the read came up short).
+                System.arraycopy(window, HOP_SAMPLES, window, 0, WINDOW_SAMPLES - HOP_SAMPLES)
+                val tail = WINDOW_SAMPLES - HOP_SAMPLES
+                for (i in 0 until read) window[tail + i] = hopPcm[i] / 32768f
+                for (i in read until HOP_SAMPLES) window[tail + i] = 0f
 
                 // ===== MICRO FRONTEND: 49×40, scaled like TF op =====
-                val features: FloatArray = MicroFrontend.compute(floatWave) // 1960 floats
+                // MicroFrontend keeps stateful noise/PCAN estimators across calls.
+                // With overlapping windows they now update once per 100 ms hop —
+                // 10x more often than the old one-shot-per-second loop. The
+                // smoothing constants are intentionally left unchanged.
+                val features: FloatArray = MicroFrontend.compute(window) // 1960 floats
 
                 input.loadArray(features)
                 val out = m.process(input).outputFeature0AsTensorBuffer.floatArray
