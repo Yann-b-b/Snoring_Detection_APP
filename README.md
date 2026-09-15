@@ -20,6 +20,17 @@ on the Khan snoring dataset (1,000 one-second clips). That repo's INT8 export
 (~244 KB) reports 90.7% accuracy; this app ships the **float** export
 (`conv_float_model.tflite`).
 
+Both exports are bundled:
+
+| Model | File | Size |
+|---|---|---|
+| Float (default) | `ml/conv_float_model.tflite` | 954,776 B (~932 KiB) |
+| INT8 (optional) | `assets/conv_int8_model.tflite` | 244,160 B (~238 KiB, ~3.9× smaller) |
+
+The INT8 model is disabled by default; flip the compile-time flag
+`USE_INT8_MODEL` in `MainActivity` to use it (input/output quantization is
+handled via each tensor's scale/zero-point).
+
 ## How it works
 1. Audio is captured at 16 kHz and analyzed over a sliding 1-second window
    with a 100 ms hop (~10 model decisions per second).

@@ -1,6 +1,7 @@
 package com.example.final_test
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -24,7 +25,11 @@ import androidx.core.content.ContextCompat
 import com.example.final_test.ml.ConvFloatModel
 import kotlinx.coroutines.*
 import org.tensorflow.lite.DataType
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.*
 
 // =============================== Activity ===============================
@@ -39,6 +44,76 @@ class MainActivity : ComponentActivity() {
         const val FEATURE_SIZE = 1960                     // 49 frames x 40 channels
         const val SNORE_PROB_WINDOW = 5                   // decisions smoothed over last N probs
         const val SNORE_THRESHOLD = 0.6f
+        const val NUM_CLASSES = 2
+
+        // Compile-time switch: false ships the float model, true the INT8
+        // export from the source repo (~4x smaller, 90.7% reported accuracy).
+        const val USE_INT8_MODEL = false
+        const val INT8_MODEL_ASSET = "conv_int8_model.tflite"
+    }
+
+    /** Uniform inference API so the float and INT8 models are interchangeable. */
+    private interface SnoreClassifier {
+        /** Feeds 1,960 micro-frontend features; returns [snoring, not_snoring]. */
+        fun classify(features: FloatArray): FloatArray
+        fun close()
+    }
+
+    private class FloatModelClassifier(context: Context) : SnoreClassifier {
+        private val model = ConvFloatModel.newInstance(context)
+        private val input =
+            TensorBuffer.createFixedSize(intArrayOf(1, FEATURE_SIZE), DataType.FLOAT32)
+
+        override fun classify(features: FloatArray): FloatArray {
+            input.loadArray(features)
+            return model.process(input).outputFeature0AsTensorBuffer.floatArray
+        }
+
+        override fun close() = model.close()
+    }
+
+    private class QuantizedModelClassifier(context: Context) : SnoreClassifier {
+        private val interpreter = Interpreter(FileUtil.loadMappedFile(context, INT8_MODEL_ASSET))
+        private val inputTensor = interpreter.getInputTensor(0)
+        private val outputTensor = interpreter.getOutputTensor(0)
+        private val inputBuffer =
+            ByteBuffer.allocateDirect(FEATURE_SIZE).order(ByteOrder.nativeOrder())
+        private val outputBuffer =
+            ByteBuffer.allocateDirect(NUM_CLASSES).order(ByteOrder.nativeOrder())
+        private val probabilities = FloatArray(NUM_CLASSES)
+
+        init {
+            val type = inputTensor.dataType()
+            require(type == DataType.UINT8 || type == DataType.INT8) {
+                "Expected a quantized input tensor, got $type"
+            }
+        }
+
+        override fun classify(features: FloatArray): FloatArray {
+            val inParams = inputTensor.quantizationParams()
+            val signedInput = inputTensor.dataType() == DataType.INT8
+            val qMin = if (signedInput) -128 else 0
+            val qMax = if (signedInput) 127 else 255
+            inputBuffer.rewind()
+            for (f in features) {
+                val q = (Math.round(f / inParams.scale) + inParams.zeroPoint).coerceIn(qMin, qMax)
+                inputBuffer.put(q.toByte())
+            }
+            inputBuffer.rewind()
+            outputBuffer.rewind()
+            interpreter.run(inputBuffer, outputBuffer)
+
+            val outParams = outputTensor.quantizationParams()
+            val signedOutput = outputTensor.dataType() == DataType.INT8
+            outputBuffer.rewind()
+            for (i in 0 until NUM_CLASSES) {
+                val raw = outputBuffer.get().toInt().let { if (signedOutput) it else it and 0xFF }
+                probabilities[i] = (raw - outParams.zeroPoint) * outParams.scale
+            }
+            return probabilities
+        }
+
+        override fun close() = interpreter.close()
     }
 
     private val requestMic =
@@ -48,12 +123,13 @@ class MainActivity : ComponentActivity() {
 
     private var listenJob: Job? = null
     private var audioRecord: AudioRecord? = null
-    private var model: ConvFloatModel? = null
+    private var classifier: SnoreClassifier? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        model = ConvFloatModel.newInstance(this)
+        classifier =
+            if (USE_INT8_MODEL) QuantizedModelClassifier(this) else FloatModelClassifier(this)
 
         setContent {
             var listening by remember { mutableStateOf(false) }
@@ -106,12 +182,11 @@ class MainActivity : ComponentActivity() {
         ).apply { startRecording() }
 
         val rec = audioRecord!!
-        val m = model ?: return
+        val m = classifier ?: return
 
         listenJob = CoroutineScope(Dispatchers.Default).launch {
             val hopPcm = ShortArray(HOP_SAMPLES)
             val window = FloatArray(WINDOW_SAMPLES)
-            val input = TensorBuffer.createFixedSize(intArrayOf(1, FEATURE_SIZE), DataType.FLOAT32)
             val probHistory = FloatArray(SNORE_PROB_WINDOW)
             val sortedProbs = FloatArray(SNORE_PROB_WINDOW)
             var probIndex = 0
@@ -139,8 +214,7 @@ class MainActivity : ComponentActivity() {
                 // smoothing constants are intentionally left unchanged.
                 val features: FloatArray = MicroFrontend.compute(window) // 1960 floats
 
-                input.loadArray(features)
-                val out = m.process(input).outputFeature0AsTensorBuffer.floatArray
+                val out = m.classify(features)
 
                 // Model output is [1,2] softmax: out[0]=snoring, out[1]=not_snoring.
                 val snoreProb = out[0]
@@ -170,8 +244,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopListening()
-        model?.close()
-        model = null
+        classifier?.close()
+        classifier = null
     }
 }
 
